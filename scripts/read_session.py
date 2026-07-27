@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Pretty-print a Claude Code, Codex, or pi session transcript."""
+"""Pretty-print a Claude Code, Codex, pi, or Grok session transcript."""
 
 import json
 import sys
+from pathlib import Path
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 
 SKIP_MARKERS = (
     "<user_instructions>", "<environment_context>",
     "<permissions instructions>", "# AGENTS.md instructions",
+    "<user_info>", "<system-reminder>", "<git_status>",
 )
 
 
@@ -60,6 +62,20 @@ def iter_messages(path):
                     continue
                 content = msg.get("content", "")
 
+            elif fmt == "grok":
+                # Grok: top-level type and a content string. Entries carrying
+                # synthetic_reason are harness context, not real turns.
+                if entry.get("synthetic_reason"):
+                    continue
+                etype = entry.get("type", "")
+                if etype in ("user", "human"):
+                    role = "user"
+                elif etype == "assistant":
+                    role = "assistant"
+                else:
+                    continue
+                content = entry.get("content", "")
+
             elif fmt == "claude":
                 # Resolve role from type or role fields
                 role = entry.get("role", "")
@@ -105,14 +121,22 @@ def iter_messages(path):
 
 
 def detect_format(path):
-    """Detect whether a session file is Claude Code, Codex, or pi format.
+    """Detect whether a session file is Claude Code, Codex, pi, or Grok format.
 
-    Detection runs on the first non-empty parseable line and returns one of
-    "pi", "claude", or "codex". Order matters: pi headers carry both `type:
-    "session"` and `cwd`, which is the most distinctive signature; Claude
-    files have `parentUuid` or a top-level `message`; Codex files have
-    `record_type`, `instructions`, or `type: "session_meta"`.
+    Grok is settled by path, since every Grok transcript is named
+    chat_history.jsonl inside a per-session directory and its entries are too
+    plain to tell apart from the others by content alone.
+
+    Otherwise detection runs on the first non-empty parseable line. Order
+    matters: pi headers carry both `type: "session"` and `cwd`, which is the
+    most distinctive signature; Claude files have `parentUuid` or a top-level
+    `message`; Codex files have `record_type`, `instructions`, or
+    `type: "session_meta"`.
     """
+    path_obj = Path(path)
+    if path_obj.name == "chat_history.jsonl" or "/.grok/sessions/" in str(path_obj):
+        return "grok"
+
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
