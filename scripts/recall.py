@@ -711,8 +711,10 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
             recency_boost = math.exp(-0.693 * age_days / 30)  # half-life = 30 days
         else:
             recency_boost = 0.0
-        # Blend: 80% BM25, 20% recency. Recency term scales with typical BM25 magnitude.
-        blended_rank = rank * (1 - 0.2 * recency_boost)
+        # Blend: 80% BM25, 20% recency. bm25() is negative and results sort
+        # ascending, so a recent session has to be made *more* negative to move
+        # up. Subtracting moved it down the page instead.
+        blended_rank = rank * (1 + 0.2 * recency_boost)
 
         results.append((session_id, meta[0], meta[1], meta[2], meta[3], meta[4], excerpt, blended_rank))
 
