@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Index only the bytes a session has added since the last run, rather than
+  deleting and re-parsing every file whose mtime moved. Sessions carry a
+  `byte_offset`, a hash of the 4 KB before it, and a `parser_version`; if any
+  of the three fails to line up the file is read in full as before.
+- Applies to Claude Code and Codex. pi keeps the full-read path until its
+  write behaviour is confirmed — see `APPEND_ONLY_SOURCES`.
+- Existing indexes upgrade in place. Each session is read in full once more and
+  picks up a resume point from then on; no reindex needed.
+- A file that cannot be read keeps whatever is already indexed for it, instead
+  of being pruned before the parse is attempted.
+
 ## 0.4.1
 
 - Make the positional `query` argument optional. When omitted, list every

@@ -178,7 +178,7 @@ class TestParsePiSession(unittest.TestCase):
             "2026-05-06T13-50-25-335Z_019dfd8d-da36-7552-b0d5-dfa08528cf9b.jsonl",
             [PI_V3_SAMPLE[0]],
         )
-        metadata, messages = recall.parse_pi_session(path)
+        metadata, messages, _ = recall.parse_pi_session(path)
         self.assertEqual(metadata["session_id"], "019dfd8d-da36-7552-b0d5-dfa08528cf9b")
         self.assertEqual(metadata["source"], "pi")
         self.assertEqual(metadata["project"], "/Users/alice/Vaults/blog")
@@ -189,7 +189,7 @@ class TestParsePiSession(unittest.TestCase):
     def test_extracts_user_and_assistant_text(self):
         """User string content and assistant TextContent are both kept."""
         path = self._write("session.jsonl", PI_V3_SAMPLE)
-        _, messages = recall.parse_pi_session(path)
+        _, messages, _ = recall.parse_pi_session(path)
 
         roles = [m[0] for m in messages]
         texts = [m[1] for m in messages]
@@ -202,7 +202,7 @@ class TestParsePiSession(unittest.TestCase):
     def test_skips_thinking_toolcall_image_blocks(self):
         """Thinking, toolCall, and image blocks are dropped from assistant content."""
         path = self._write("session.jsonl", PI_V3_SAMPLE)
-        _, messages = recall.parse_pi_session(path)
+        _, messages, _ = recall.parse_pi_session(path)
 
         # Assistant turn had thinking + text + toolCall — only text should remain
         assistant_texts = [t for r, t in messages if r == "assistant"]
@@ -215,7 +215,7 @@ class TestParsePiSession(unittest.TestCase):
     def test_skips_toolresult_and_bashexecution(self):
         """toolResult and bashExecution roles produce no indexed messages."""
         path = self._write("session.jsonl", PI_V3_SAMPLE)
-        _, messages = recall.parse_pi_session(path)
+        _, messages, _ = recall.parse_pi_session(path)
 
         roles = [m[0] for m in messages]
         self.assertNotIn("toolResult", roles)
@@ -224,7 +224,7 @@ class TestParsePiSession(unittest.TestCase):
     def test_skips_non_message_top_level_types(self):
         """custom, custom_message, session_info, model_change, thinking_level_change skipped."""
         path = self._write("session.jsonl", PI_V3_SAMPLE)
-        _, messages = recall.parse_pi_session(path)
+        _, messages, _ = recall.parse_pi_session(path)
 
         joined = "\n".join(t for _, t in messages)
         self.assertNotIn("extension-injected note", joined)
@@ -264,20 +264,20 @@ class TestParsePiSession(unittest.TestCase):
             },
         ]
         path = self._write("session.jsonl", entries)
-        _, messages = recall.parse_pi_session(path)
+        _, messages, _ = recall.parse_pi_session(path)
         self.assertEqual(messages, [])
 
     def test_slug_includes_date_and_short_id(self):
         """Slug derived from filename: YYYY-MM-DD-<uuid8>."""
         name = "2026-05-06T13-50-25-335Z_019dfd8d-da36-7552-b0d5-dfa08528cf9b.jsonl"
         path = self._write(name, [PI_V3_SAMPLE[0]])
-        metadata, _ = recall.parse_pi_session(path)
+        metadata, _, _ = recall.parse_pi_session(path)
         self.assertEqual(metadata["slug"], "2026-05-06-019dfd8d")
 
     def test_slug_fallback_when_filename_unusual(self):
         """Filename without the expected pattern: slug falls back to a session-id prefix."""
         path = self._write("oddname.jsonl", [PI_V3_SAMPLE[0]])
-        metadata, _ = recall.parse_pi_session(path)
+        metadata, _, _ = recall.parse_pi_session(path)
         # Either short_id or session_id prefix — both are acceptable; just non-empty.
         self.assertTrue(metadata["slug"])
 
@@ -288,7 +288,7 @@ class TestParsePiSession(unittest.TestCase):
             f.write(json.dumps(PI_V3_SAMPLE[0]) + "\n")
             f.write("this is not json\n")
             f.write(json.dumps(PI_V3_SAMPLE[1]) + "\n")  # user message
-        _, messages = recall.parse_pi_session(str(path))
+        _, messages, _ = recall.parse_pi_session(str(path))
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0][0], "user")
 
@@ -301,7 +301,7 @@ class TestParsePiSession(unittest.TestCase):
             f.write("\n\n")
             f.write(json.dumps(PI_V3_SAMPLE[1]) + "\n")
             f.write("\n")
-        _, messages = recall.parse_pi_session(str(path))
+        _, messages, _ = recall.parse_pi_session(str(path))
         self.assertEqual(len(messages), 1)
 
     def test_string_content_user_message(self):
@@ -317,7 +317,7 @@ class TestParsePiSession(unittest.TestCase):
             },
         ]
         path = self._write("session.jsonl", entries)
-        _, messages = recall.parse_pi_session(path)
+        _, messages, _ = recall.parse_pi_session(path)
         self.assertEqual(messages, [("user", "hello world")])
 
     def test_returns_none_on_unreadable_file(self):

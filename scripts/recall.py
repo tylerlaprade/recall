@@ -3,6 +3,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import sqlite3
 import sys
 import math
 import time
+from collections import namedtuple
 from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
@@ -29,6 +31,27 @@ PI_SESSIONS_DIR = PI_DIR / "agent" / "sessions"
 # searching the index as it stands. Waiting forever would turn one stalled
 # process into a hang in every other session.
 LOCK_WAIT_SECONDS = 20
+
+# Sources that only ever append to a transcript, so a byte offset into one
+# still means what it meant last run. pi is left out until someone who runs it
+# can confirm it never rewrites a session in place; it costs only a full read.
+APPEND_ONLY_SOURCES = {"claude", "codex"}
+
+# Bytes before a resume point that must still match for a tail read to be safe.
+# Removing a message from the middle of a transcript shifts every later byte,
+# which lands inside this window; 4 KB is far more than one entry.
+TAIL_WINDOW = 4096
+
+# Stored per session. Bump it when a parser starts keeping or dropping
+# different text, so sessions already indexed are read again rather than
+# keeping a mix of old and new parsing for good.
+PARSER_VERSION = 1
+
+# What the index already holds for one session file.
+Indexed = namedtuple(
+    "Indexed",
+    "session_id mtime byte_offset tail_hash parser_version project slug timestamp",
+)
 
 
 @contextmanager
@@ -83,7 +106,10 @@ def create_schema(conn):
             project TEXT,
             slug TEXT,
             timestamp INTEGER,
-            mtime REAL
+            mtime REAL,
+            byte_offset INTEGER DEFAULT 0,
+            tail_hash TEXT,
+            parser_version INTEGER DEFAULT 0
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
@@ -102,19 +128,30 @@ def create_schema(conn):
     """)
 
 
-def migrate_schema(conn):
-    """Add columns if upgrading from an older schema."""
-    try:
-        conn.execute("SELECT source FROM sessions LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'claude'")
-        conn.commit()
-    try:
-        conn.execute("SELECT file_path FROM sessions LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE sessions ADD COLUMN file_path TEXT DEFAULT ''")
-        conn.commit()
+ADDED_COLUMNS = (
+    ("source", "TEXT DEFAULT 'claude'"),
+    ("file_path", "TEXT DEFAULT ''"),
+    ("byte_offset", "INTEGER DEFAULT 0"),
+    ("tail_hash", "TEXT"),
+    ("parser_version", "INTEGER DEFAULT 0"),
+)
 
+
+def migrate_schema(conn):
+    """Add whatever columns an index built by an older version is missing.
+
+    Rows keep byte_offset 0, so each session is read in full once more and
+    picks up a resume point from then on. No rebuild needed.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    for name, definition in ADDED_COLUMNS:
+        if name not in present:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
+    if "parser_version" not in present:
+        # Sessions already indexed were parsed by the parsers as they stand.
+        # Stamping them says so, rather than making every one be read again.
+        conn.execute("UPDATE sessions SET parser_version = ?", (PARSER_VERSION,))
+    conn.commit()
 
 
 def migrate_db_location():
@@ -131,6 +168,75 @@ def migrate_db_location():
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 CODEX_SKIP_MARKERS = ("<user_instructions>", "<environment_context>", "<permissions instructions>", "# AGENTS.md instructions")
+
+
+def read_complete_lines(path, start=0):
+    """Yield (line, offset just past it) for whole lines from `start`.
+
+    Iterating the file reads a buffer at a time, so a very large transcript
+    costs no more memory than its longest line. A session being written can end
+    mid-line, and that fragment is left for the next run rather than parsed
+    into half a message.
+    """
+    with open(path, "rb") as f:
+        f.seek(start)
+        offset = start
+        for raw in f:
+            # Only the last line can lack its newline, and only while it is
+            # still being written.
+            if not raw.endswith(b"\n"):
+                return
+            offset += len(raw)
+            yield raw.decode("utf-8", errors="replace"), offset
+
+
+def iter_entries(path, start=0):
+    """Yield (decoded entry, offset just past its line) for each JSON line.
+
+    Blank and unparseable lines are skipped, as every parser here has always
+    done — a corrupt line should cost one message, not the session.
+    """
+    for line, offset in read_complete_lines(path, start):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        yield entry, offset
+
+
+def tail_hash_at(path, offset):
+    """Fingerprint the bytes just before `offset` — what was indexed up to.
+
+    Comparing this against the stored value answers the only question a tail
+    read depends on: is this still the file we left off in the middle of?
+    """
+    window = min(TAIL_WINDOW, offset)
+    if window <= 0:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset - window)
+            data = f.read(window)
+    except OSError:
+        return None
+    if len(data) != window:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def resume_offset(path, offset, tail_hash, parser_version):
+    """Offset to resume parsing from, or 0 when the file must be read in full.
+
+    A file that was only appended to still carries the bytes hashed last time.
+    One that was truncated, replaced, or had an entry removed from the middle
+    does not, and is read again from the start.
+    """
+    if not offset or not tail_hash or parser_version != PARSER_VERSION:
+        return 0
+    return offset if tail_hash_at(path, offset) == tail_hash else 0
 
 
 def extract_text(content):
@@ -168,68 +274,66 @@ def parse_iso_timestamp(ts_str):
 
 # — Claude Code session parser —————————————————————————————————————————————
 
-def parse_claude_session(path):
-    """Parse a Claude Code JSONL session file, returning (metadata, messages)."""
+def parse_claude_session(path, start=0):
+    """Parse a Claude Code JSONL session file.
+
+    Returns (metadata, messages, offset just past the last complete line).
+    With `start` past 0 only the bytes after it are read, so the metadata
+    reflects the tail alone and the caller keeps what it already stored.
+    """
     session_id = Path(path).stem
     project = None
     slug = None
     earliest_ts = None
     messages = []
 
+    end_offset = start
+
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        for entry, end_offset in iter_entries(path, start):
+            etype = entry.get("type", "")
 
-                etype = entry.get("type", "")
+            # Extract cwd from any entry
+            if not project:
+                cwd = entry.get("cwd", "")
+                if cwd:
+                    project = cwd
 
-                # Extract cwd from any entry
-                if not project:
-                    cwd = entry.get("cwd", "")
-                    if cwd:
-                        project = cwd
+            # Extract slug from any entry
+            if not slug:
+                slug = entry.get("slug", "") or entry.get("leafName", "")
 
-                # Extract slug from any entry
-                if not slug:
-                    slug = entry.get("slug", "") or entry.get("leafName", "")
+            # Parse timestamp
+            ts_raw = entry.get("timestamp")
+            ts_ms = parse_iso_timestamp(ts_raw)
+            if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
+                earliest_ts = ts_ms
 
-                # Parse timestamp
-                ts_raw = entry.get("timestamp")
-                ts_ms = parse_iso_timestamp(ts_raw)
-                if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
-                    earliest_ts = ts_ms
-
-                # Determine role: check both "type" and "role" fields
-                role = entry.get("role", "")
-                if role not in ("user", "assistant"):
-                    if etype == "user" or etype == "human":
-                        role = "user"
-                    elif etype == "assistant":
-                        role = "assistant"
-                    else:
-                        continue
-
-                # Extract text content — handle multiple formats:
-                # 1. {message: {content: "..."}} or {message: {content: [{type:"text",...}]}}
-                # 2. {content: "..."} or {content: [...]}
-                content = entry.get("message", {})
-                if isinstance(content, dict):
-                    content = content.get("content", "")
-                elif isinstance(content, str):
-                    # message field is a plain string
-                    pass
+            # Determine role: check both "type" and "role" fields
+            role = entry.get("role", "")
+            if role not in ("user", "assistant"):
+                if etype == "user" or etype == "human":
+                    role = "user"
+                elif etype == "assistant":
+                    role = "assistant"
                 else:
-                    content = entry.get("content", "")
+                    continue
 
-                text = extract_text(content)
-                if text:
-                    messages.append((role, text))
+            # Extract text content — handle multiple formats:
+            # 1. {message: {content: "..."}} or {message: {content: [{type:"text",...}]}}
+            # 2. {content: "..."} or {content: [...]}
+            content = entry.get("message", {})
+            if isinstance(content, dict):
+                content = content.get("content", "")
+            elif isinstance(content, str):
+                # message field is a plain string
+                pass
+            else:
+                content = entry.get("content", "")
+
+            text = extract_text(content)
+            if text:
+                messages.append((role, text))
 
     except (OSError, PermissionError) as e:
         print(f"Warning: skipping {path}: {e}", file=sys.stderr)
@@ -246,12 +350,12 @@ def parse_claude_session(path):
         "slug": slug,
         "timestamp": earliest_ts or 0,
     }
-    return metadata, messages
+    return metadata, messages, end_offset
 
 
 # — Codex session parser ———————————————————————————————————————————————————
 
-def parse_codex_session(path):
+def parse_codex_session(path, start=0):
     """Parse a Codex JSONL session file, returning (metadata, messages).
 
     Codex sessions live in ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl.
@@ -275,84 +379,77 @@ def parse_codex_session(path):
         session_id,
     )
 
+    end_offset = start
+
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        for entry, end_offset in iter_entries(path, start):
+            # Skip state snapshots (legacy format)
+            if entry.get("record_type") == "state":
+                continue
 
-                # Skip state snapshots (legacy format)
-                if entry.get("record_type") == "state":
-                    continue
+            # Parse timestamp (present in both formats at top level)
+            ts_raw = entry.get("timestamp")
+            if ts_raw:
+                ts_ms = parse_iso_timestamp(ts_raw)
+                if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
+                    earliest_ts = ts_ms
 
-                # Parse timestamp (present in both formats at top level)
-                ts_raw = entry.get("timestamp")
-                if ts_raw:
-                    ts_ms = parse_iso_timestamp(ts_raw)
-                    if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
-                        earliest_ts = ts_ms
+            etype = entry.get("type", "")
 
-                etype = entry.get("type", "")
+            # Current format: {type: "session_meta", payload: {id, cwd, ...}}
+            if etype == "session_meta":
+                payload = entry.get("payload", {})
+                entry_id = payload.get("id", "")
+                if entry_id and session_id.startswith("rollout-"):
+                    session_id = entry_id
+                if not project:
+                    project = payload.get("cwd", "")
+                continue
 
-                # Current format: {type: "session_meta", payload: {id, cwd, ...}}
-                if etype == "session_meta":
-                    payload = entry.get("payload", {})
-                    entry_id = payload.get("id", "")
+            # Current format: {type: "response_item", payload: {role, content, ...}}
+            # Legacy format: {role, content, ...} (no type or type="message")
+            if etype == "response_item":
+                payload = entry.get("payload", {})
+                role = payload.get("role", "")
+                content = payload.get("content", "")
+            elif etype in ("event_msg", "turn_context"):
+                continue
+            else:
+                # Legacy format — session metadata in first entry
+                if not project and "id" in entry and "instructions" in entry:
+                    entry_id = entry.get("id", "")
                     if entry_id and session_id.startswith("rollout-"):
                         session_id = entry_id
-                    if not project:
-                        project = payload.get("cwd", "")
                     continue
 
-                # Current format: {type: "response_item", payload: {role, content, ...}}
-                # Legacy format: {role, content, ...} (no type or type="message")
-                if etype == "response_item":
-                    payload = entry.get("payload", {})
-                    role = payload.get("role", "")
-                    content = payload.get("content", "")
-                elif etype in ("event_msg", "turn_context"):
-                    continue
-                else:
-                    # Legacy format — session metadata in first entry
-                    if not project and "id" in entry and "instructions" in entry:
-                        entry_id = entry.get("id", "")
-                        if entry_id and session_id.startswith("rollout-"):
-                            session_id = entry_id
-                        continue
+                role = entry.get("role", "")
+                content = entry.get("content", "")
 
-                    role = entry.get("role", "")
-                    content = entry.get("content", "")
+                # Legacy: extract cwd from <environment_context> blocks
+                if not project and isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict):
+                            text = block.get("text", "")
+                            if "Current working directory:" in text:
+                                cwd_match = re.search(
+                                    r"Current working directory:\s*(.+)", text
+                                )
+                                if cwd_match:
+                                    project = cwd_match.group(1).strip()
 
-                    # Legacy: extract cwd from <environment_context> blocks
-                    if not project and isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict):
-                                text = block.get("text", "")
-                                if "Current working directory:" in text:
-                                    cwd_match = re.search(
-                                        r"Current working directory:\s*(.+)", text
-                                    )
-                                    if cwd_match:
-                                        project = cwd_match.group(1).strip()
+            # Only index user and assistant messages (skip developer/system)
+            if role not in ("user", "assistant"):
+                continue
 
-                # Only index user and assistant messages (skip developer/system)
-                if role not in ("user", "assistant"):
-                    continue
+            text = extract_text(content)
 
-                text = extract_text(content)
+            # Skip system/instruction blocks injected as user messages
+            if not text:
+                continue
+            if any(marker in text for marker in CODEX_SKIP_MARKERS):
+                continue
 
-                # Skip system/instruction blocks injected as user messages
-                if not text:
-                    continue
-                if any(marker in text for marker in CODEX_SKIP_MARKERS):
-                    continue
-
-                messages.append((role, text))
+            messages.append((role, text))
 
     except (OSError, PermissionError) as e:
         print(f"Warning: skipping {path}: {e}", file=sys.stderr)
@@ -370,12 +467,12 @@ def parse_codex_session(path):
         "slug": slug,
         "timestamp": earliest_ts or 0,
     }
-    return metadata, messages
+    return metadata, messages, end_offset
 
 
 # — Pi session parser ——————————————————————————————————————————————————————
 
-def parse_pi_session(path):
+def parse_pi_session(path, start=0):
     """Parse a pi (earendil-works/pi-coding-agent) JSONL session file.
 
     Pi sessions live in ~/.pi/agent/sessions/--<encoded-cwd>--/<ts>_<uuid>.jsonl.
@@ -403,57 +500,50 @@ def parse_pi_session(path):
         session_id,
     )
 
+    end_offset = start
+
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        for entry, end_offset in iter_entries(path, start):
+            etype = entry.get("type", "")
 
-                etype = entry.get("type", "")
-
-                # Session header — first line, metadata only.
-                if etype == "session":
-                    entry_id = entry.get("id", "")
-                    if entry_id:
-                        session_id = entry_id
-                    if not project:
-                        project = entry.get("cwd", "")
-                    ts_ms = parse_iso_timestamp(entry.get("timestamp"))
-                    if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
-                        earliest_ts = ts_ms
-                    continue
-
-                # Skip everything that isn't a conversational message:
-                # custom (extension state), custom_message (extension-injected),
-                # session_info (display name), model_change, thinking_level_change,
-                # compaction, branch_summary, label.
-                if etype != "message":
-                    continue
-
-                # Track earliest entry timestamp defensively in case the header
-                # is missing or files are partially written.
+            # Session header — first line, metadata only.
+            if etype == "session":
+                entry_id = entry.get("id", "")
+                if entry_id:
+                    session_id = entry_id
+                if not project:
+                    project = entry.get("cwd", "")
                 ts_ms = parse_iso_timestamp(entry.get("timestamp"))
                 if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
                     earliest_ts = ts_ms
+                continue
 
-                msg = entry.get("message", {})
-                if not isinstance(msg, dict):
-                    continue
+            # Skip everything that isn't a conversational message:
+            # custom (extension state), custom_message (extension-injected),
+            # session_info (display name), model_change, thinking_level_change,
+            # compaction, branch_summary, label.
+            if etype != "message":
+                continue
 
-                role = msg.get("role", "")
-                # Only index user and assistant messages — skip toolResult,
-                # bashExecution, and any other non-conversational roles.
-                if role not in ("user", "assistant"):
-                    continue
+            # Track earliest entry timestamp defensively in case the header
+            # is missing or files are partially written.
+            ts_ms = parse_iso_timestamp(entry.get("timestamp"))
+            if ts_ms and (earliest_ts is None or ts_ms < earliest_ts):
+                earliest_ts = ts_ms
 
-                text = extract_text(msg.get("content", ""))
-                if text:
-                    messages.append((role, text))
+            msg = entry.get("message", {})
+            if not isinstance(msg, dict):
+                continue
+
+            role = msg.get("role", "")
+            # Only index user and assistant messages — skip toolResult,
+            # bashExecution, and any other non-conversational roles.
+            if role not in ("user", "assistant"):
+                continue
+
+            text = extract_text(msg.get("content", ""))
+            if text:
+                messages.append((role, text))
 
     except (OSError, PermissionError) as e:
         print(f"Warning: skipping {path}: {e}", file=sys.stderr)
@@ -473,7 +563,7 @@ def parse_pi_session(path):
         "slug": slug,
         "timestamp": earliest_ts or 0,
     }
-    return metadata, messages
+    return metadata, messages, end_offset
 
 
 # — Indexing ———————————————————————————————————————————————————————————————
@@ -488,12 +578,13 @@ def index_sessions(conn, force=False):
         """)
 
     # Get existing mtimes keyed by file_path (stable across session_id changes)
-    existing = {}
-    try:
-        for row in conn.execute("SELECT file_path, session_id, mtime FROM sessions"):
-            existing[row[0]] = (row[1], row[2])
-    except sqlite3.OperationalError:
-        pass
+    existing = {
+        row[0]: Indexed(*row[1:])
+        for row in conn.execute(
+            "SELECT file_path, session_id, mtime, byte_offset, tail_hash, "
+            "parser_version, project, slug, timestamp FROM sessions"
+        )
+    }
 
     # Collect files from both sources
     sources = []
@@ -526,36 +617,67 @@ def index_sessions(conn, force=False):
         except OSError:
             continue
 
-        if not force and fpath in existing and existing[fpath][1] == mtime:
+        prior = existing.get(fpath)
+        if prior and prior.mtime == mtime and prior.parser_version == PARSER_VERSION:
             skipped += 1
             continue
 
-        # Remove old data for this file if re-indexing
-        if fpath in existing:
-            old_sid = existing[fpath][0]
-            conn.execute("DELETE FROM sessions WHERE session_id = ?", (old_sid,))
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (old_sid,))
-            conn.execute("DELETE FROM messages_cjk WHERE session_id = ?", (old_sid,))
+        # Read only what is new, where the source only appends and the bytes
+        # left off after are still the ones hashed last time.
+        start = 0
+        if prior and source in APPEND_ONLY_SOURCES:
+            start = resume_offset(fpath, prior.byte_offset, prior.tail_hash,
+                                  prior.parser_version)
 
         if source == "claude":
-            result = parse_claude_session(fpath)
+            result = parse_claude_session(fpath, start)
         elif source == "codex":
-            result = parse_codex_session(fpath)
+            result = parse_codex_session(fpath, start)
         else:  # pi
-            result = parse_pi_session(fpath)
+            result = parse_pi_session(fpath, start)
 
+        # A file that could not be read keeps whatever is already indexed for
+        # it, rather than being pruned on a transient error.
         if result is None:
             continue
 
-        metadata, messages = result
+        # Remove old data for this file unless the read picked up where the
+        # last one stopped.
+        if prior and not start:
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (prior.session_id,))
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (prior.session_id,))
+            conn.execute("DELETE FROM messages_cjk WHERE session_id = ?", (prior.session_id,))
 
-        conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (metadata["session_id"], metadata["source"], metadata["file_path"],
-             metadata["project"], metadata["slug"], metadata["timestamp"], mtime),
-        )
+        metadata, messages, end_offset = result
+        # Only record a resume point for a source worth resuming.
+        if source not in APPEND_ONLY_SOURCES:
+            end_offset = 0
+        tail_hash = tail_hash_at(fpath, end_offset)
 
-        msg_rows = [(metadata["session_id"], role, text) for role, text in messages]
+        if start:
+            # Only the tail was read, so merge the way a full read would: the
+            # first non-empty value wins, and the timestamp is the earliest
+            # seen anywhere in the file.
+            session_id = prior.session_id
+            stamps = [t for t in (prior.timestamp, metadata["timestamp"]) if t]
+            conn.execute(
+                "UPDATE sessions SET project = ?, slug = ?, timestamp = ?, "
+                "mtime = ?, byte_offset = ?, tail_hash = ?, parser_version = ? "
+                "WHERE session_id = ?",
+                (prior.project or metadata["project"], prior.slug or metadata["slug"],
+                 min(stamps) if stamps else 0,
+                 mtime, end_offset, tail_hash, PARSER_VERSION, session_id),
+            )
+        else:
+            session_id = metadata["session_id"]
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, byte_offset, tail_hash, parser_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, metadata["source"], metadata["file_path"],
+                 metadata["project"], metadata["slug"], metadata["timestamp"],
+                 mtime, end_offset, tail_hash, PARSER_VERSION),
+            )
+
+        msg_rows = [(session_id, role, text) for role, text in messages]
         conn.executemany(
             "INSERT INTO messages (session_id, role, text) VALUES (?, ?, ?)",
             msg_rows,
