@@ -92,6 +92,14 @@ class IndexLock(unittest.TestCase):
                     pass
         self.assertIn("Another process is indexing", stderr.getvalue())
 
+    def test_runs_unlocked_where_fcntl_is_unavailable(self):
+        # Windows: no flock, so indexing proceeds as it did before the lock.
+        self.addCleanup(setattr, recall, "fcntl", recall.fcntl)
+        recall.fcntl = None
+        with recall.index_lock() as have_lock:
+            self.assertTrue(have_lock)
+        self.assertFalse(os.path.exists(self.lock_path))
+
     def test_the_lock_file_is_created_if_absent(self):
         self.assertFalse(os.path.exists(self.lock_path))
         with recall.index_lock() as have_lock:

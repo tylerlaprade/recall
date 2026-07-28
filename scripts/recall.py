@@ -2,7 +2,6 @@
 """Search past Claude Code, Codex, and pi sessions using FTS5 full-text search."""
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -14,6 +13,11 @@ from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; run unlocked as before
+    fcntl = None
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
@@ -41,7 +45,12 @@ def index_lock():
     means the second run simply skips indexing and searches.
 
     Yields True when the lock was taken, False when the wait ran out.
+    On platforms without fcntl (Windows), yields True without locking,
+    which is the pre-lock behavior.
     """
+    if fcntl is None:
+        yield True
+        return
     with open(DB_LOCK_PATH, "a", encoding="utf-8") as lock_file:
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
