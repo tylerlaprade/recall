@@ -151,6 +151,19 @@ class DetectGrokFormat(unittest.TestCase):
             ("assistant", "the toolchain is pinned to x86"),
         ])
 
+    def test_claude_turns_with_reminder_blocks_are_kept(self):
+        # Claude Code appends system-reminder blocks to genuine user prompts
+        # inside the same message; the grok-scoped markers leave those intact.
+        claude = Path(self.root) / "session.jsonl"
+        claude.write_text(json.dumps(
+            {"parentUuid": None, "type": "user", "message": {"role": "user", "content": [
+                {"type": "text", "text": "why does the deploy fail"},
+                {"type": "text", "text": "<system-reminder>CLAUDE.md contents</system-reminder>"},
+            ]}}) + "\n", encoding="utf-8")
+        turns = list(read_session.iter_messages(str(claude)))
+        self.assertEqual(len(turns), 1)
+        self.assertIn("why does the deploy fail", turns[0][1])
+
     def test_other_formats_are_still_detected(self):
         claude = Path(self.root) / "claude.jsonl"
         claude.write_text(json.dumps(

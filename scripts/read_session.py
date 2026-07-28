@@ -10,8 +10,11 @@ TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 SKIP_MARKERS = (
     "<user_instructions>", "<environment_context>",
     "<permissions instructions>", "# AGENTS.md instructions",
-    "<user_info>", "<system-reminder>", "<git_status>",
 )
+
+# Grok-only: these appear inside genuine Claude user turns (system-reminder
+# blocks are appended to real prompts), so they must not be in the shared list.
+GROK_SKIP_MARKERS = ("<user_info>", "<system-reminder>", "<git_status>")
 
 
 def extract_text(content):
@@ -114,7 +117,8 @@ def iter_messages(path):
                     continue
 
             text = extract_text(content)
-            if not text or any(marker in text for marker in SKIP_MARKERS):
+            markers = SKIP_MARKERS + (GROK_SKIP_MARKERS if fmt == "grok" else ())
+            if not text or any(marker in text for marker in markers):
                 continue
 
             yield role, text
