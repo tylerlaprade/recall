@@ -947,12 +947,15 @@ def main():
     conn.execute("PRAGMA synchronous=NORMAL")
     create_schema(conn)
     migrate_schema(conn)
-    migrate_message_columns(conn)
 
-    # Index — one run at a time, so concurrent runs queue instead of colliding
+    # Index — one run at a time, so concurrent runs queue instead of colliding.
+    # The role-column rebuild takes seconds on a large index, well past
+    # SQLite's busy timeout, so it must sit inside the lock too; a run that
+    # doesn't get the lock searches the old schema, which still works.
     t0 = time.time()
     with index_lock() as have_lock:
         if have_lock:
+            migrate_message_columns(conn)
             indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
         else:
             indexed = 0

@@ -138,6 +138,26 @@ class RebuildingAnOlderIndex(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_the_rebuild_runs_inside_the_index_lock(self):
+        """The rebuild takes seconds on a large index, past SQLite's busy
+        timeout, so main must only attempt it while holding the index lock —
+        otherwise a concurrent run dies with "database is locked", the crash
+        the lock exists to prevent. A run without the lock searches the old
+        schema, which still works."""
+        import inspect
+        src = inspect.getsource(recall.main)
+        self.assertIn("migrate_message_columns", src)
+        self.assertLess(src.index("with index_lock()"),
+                        src.index("migrate_message_columns"))
+
+        # And the old schema a lockless run is left searching still answers.
+        conn = self.old_index()
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE messages MATCH 'irreplaceable'").fetchone()[0], 1)
+        finally:
+            conn.close()
+
     def test_an_interrupted_rebuild_leaves_the_index_usable(self):
         """It is one transaction, so a run killed part way through rolls back
         rather than leaving a half-built table for the next run to die on."""
