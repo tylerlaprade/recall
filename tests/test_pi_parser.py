@@ -512,7 +512,7 @@ class TestRealPiSession(unittest.TestCase):
 
         result = recall.parse_pi_session(str(smallest))
         self.assertIsNotNone(result)
-        metadata, messages = result
+        metadata, messages, _ = result
         self.assertEqual(metadata["source"], "pi")
         self.assertTrue(metadata["session_id"])
         self.assertTrue(metadata["slug"])
