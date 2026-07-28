@@ -9,20 +9,68 @@ import sqlite3
 import sys
 import math
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
 from pathlib import Path
 from urllib.parse import unquote
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; run unlocked as before
+    fcntl = None
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
 PI_DIR = Path.home() / ".pi"
 GROK_DIR = Path.home() / ".grok"
 DB_PATH = Path.home() / ".recall.db"
+DB_LOCK_PATH = Path.home() / ".recall.db.lock"
 CLAUDE_PROJECTS_DIR = CLAUDE_DIR / "projects"
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 PI_SESSIONS_DIR = PI_DIR / "agent" / "sessions"
 GROK_SESSIONS_DIR = GROK_DIR / "sessions"
+
+
+# How long a run waits for another run to finish indexing before giving up and
+# searching the index as it stands. Waiting forever would turn one stalled
+# process into a hang in every other session.
+LOCK_WAIT_SECONDS = 20
+
+
+@contextmanager
+def index_lock():
+    """Hold an exclusive lock for the duration of an index update.
+
+    Indexing is one write transaction spanning every file it parses, so a
+    second run that starts during a long index waits on SQLite's busy timeout
+    and then dies with "database is locked". Waiting on a file lock instead
+    means the second run simply skips indexing and searches.
+
+    Yields True when the lock was taken, False when the wait ran out.
+    On platforms without fcntl (Windows), yields True without locking,
+    which is the pre-lock behavior.
+    """
+    if fcntl is None:
+        yield True
+        return
+    with open(DB_LOCK_PATH, "a", encoding="utf-8") as lock_file:
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(
+                        "Another process is indexing; searching the current index.",
+                        file=sys.stderr,
+                    )
+                    yield False
+                    return
+                time.sleep(0.1)
+        # Closing the file releases the lock on every path, exceptions included.
+        yield True
 
 
 CJK_RE = re.compile(
@@ -636,11 +684,15 @@ def index_sessions(conn, force=False):
         conn.execute("INSERT INTO messages_cjk(messages_cjk, rank) VALUES('automerge', 4)")
         conn.commit()
 
-    # Get totals
-    total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-    total_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    return indexed, skipped, *index_totals(conn)
 
-    return indexed, skipped, total_sessions, total_messages
+
+def index_totals(conn):
+    """How many sessions and messages the index currently holds."""
+    return (
+        conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
+        conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+    )
 
 
 # — Search —————————————————————————————————————————————————————————————————
@@ -851,9 +903,14 @@ def main():
     create_schema(conn)
     migrate_schema(conn)
 
-    # Index
+    # Index — one run at a time, so concurrent runs queue instead of colliding
     t0 = time.time()
-    indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
+    with index_lock() as have_lock:
+        if have_lock:
+            indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
+        else:
+            indexed = 0
+            total_sessions, total_messages = index_totals(conn)
     index_time = time.time() - t0
 
     if indexed > 0:
