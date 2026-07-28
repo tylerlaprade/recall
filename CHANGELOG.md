@@ -12,6 +12,16 @@
   picks up a resume point from then on; no reindex needed.
 - A file that cannot be read keeps whatever is already indexed for it, instead
   of being pruned before the parse is attempted.
+- Add Grok CLI session support — indexes `~/.grok/sessions/**/chat_history.jsonl`
+  alongside Claude Code, Codex and pi
+- New `--source grok` filter; results tagged `[grok]`
+- Grok sessions are one directory each, with the cwd percent-encoded into the
+  parent directory name and an optional `summary.json` supplying the title,
+  cwd and creation time. Transcript entries carry no timestamps of their own.
+- Entries marked `synthetic_reason` are harness context rather than real turns,
+  and are skipped, as are `<user_info>`, `<system-reminder>` and `<git_status>`
+  blocks
+- `read_session.py` reads Grok transcripts, detected by path
 
 ## 0.4.1
 

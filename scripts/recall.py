@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Search past Claude Code, Codex, and pi sessions using FTS5 full-text search."""
+"""Search past Claude Code, Codex, pi and Grok sessions using FTS5 full-text search."""
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -16,15 +15,23 @@ from contextlib import contextmanager
 from datetime import datetime
 from glob import glob
 from pathlib import Path
+from urllib.parse import unquote
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; run unlocked as before
+    fcntl = None
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
 PI_DIR = Path.home() / ".pi"
+GROK_DIR = Path.home() / ".grok"
 DB_PATH = Path.home() / ".recall.db"
 DB_LOCK_PATH = Path.home() / ".recall.db.lock"
 CLAUDE_PROJECTS_DIR = CLAUDE_DIR / "projects"
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
 PI_SESSIONS_DIR = PI_DIR / "agent" / "sessions"
+GROK_SESSIONS_DIR = GROK_DIR / "sessions"
 
 
 # How long a run waits for another run to finish indexing before giving up and
@@ -64,7 +71,12 @@ def index_lock():
     means the second run simply skips indexing and searches.
 
     Yields True when the lock was taken, False when the wait ran out.
+    On platforms without fcntl (Windows), yields True without locking,
+    which is the pre-lock behavior.
     """
+    if fcntl is None:
+        yield True
+        return
     with open(DB_LOCK_PATH, "a", encoding="utf-8") as lock_file:
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
@@ -168,6 +180,7 @@ def migrate_db_location():
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 CODEX_SKIP_MARKERS = ("<user_instructions>", "<environment_context>", "<permissions instructions>", "# AGENTS.md instructions")
+GROK_SKIP_MARKERS = ("<user_info>", "<system-reminder>", "<git_status>")
 
 
 def read_complete_lines(path, start=0):
@@ -566,6 +579,88 @@ def parse_pi_session(path, start=0):
     return metadata, messages, end_offset
 
 
+def parse_grok_session(path, start=0):
+    """Parse a Grok CLI chat_history.jsonl.
+
+    Returns (metadata, messages, offset just past the last complete line).
+    The offset is tracked but unused for now: grok is not in
+    APPEND_ONLY_SOURCES, so every read starts from 0.
+
+    Grok sessions live in ~/.grok/sessions/<percent-encoded-cwd>/<uuid>/, one
+    directory per session, with the transcript in chat_history.jsonl. Entries
+    carry a top-level "type" and a "content" string; there are no timestamps,
+    so the session's time comes from the optional sibling summary.json, which
+    also supplies the cwd and the generated title.
+
+    Entries marked with "synthetic_reason" are harness context Grok injects
+    into the turn list rather than anything the user or the model said, so they
+    are skipped, as are the harness blocks in GROK_SKIP_MARKERS.
+    """
+    path = Path(path)
+    session_dir = path.parent
+    session_id = session_dir.name
+    project = ""
+    slug = None
+    earliest_ts = None
+    messages = []
+
+    summary_path = session_dir / "summary.json"
+    if summary_path.is_file():
+        try:
+            with open(summary_path, "r", encoding="utf-8", errors="replace") as f:
+                summary = json.load(f)
+            info = summary.get("info") or {}
+            project = info.get("cwd") or summary.get("git_root_dir") or ""
+            slug = summary.get("generated_title") or summary.get("session_summary") or None
+            earliest_ts = parse_iso_timestamp(summary.get("created_at"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+    if not project:
+        # The parent directory is the percent-encoded absolute cwd.
+        project = unquote(session_dir.parent.name)
+
+    end_offset = start
+
+    try:
+        for entry, end_offset in iter_entries(path, start):
+            if entry.get("synthetic_reason"):
+                continue
+
+            etype = entry.get("type", "")
+            if etype in ("user", "human"):
+                role = "user"
+            elif etype == "assistant":
+                role = "assistant"
+            else:
+                continue
+
+            text = extract_text(entry.get("content", ""))
+            if not text:
+                continue
+            if any(marker in text for marker in GROK_SKIP_MARKERS):
+                continue
+
+            messages.append((role, text))
+
+    except (OSError, PermissionError) as e:
+        print(f"Warning: skipping {path}: {e}", file=sys.stderr)
+        return None
+
+    if not slug:
+        slug = session_id[:12]
+
+    metadata = {
+        "session_id": session_id,
+        "source": "grok",
+        "file_path": str(path),
+        "project": project,
+        "slug": slug,
+        "timestamp": earliest_ts or 0,
+    }
+    return metadata, messages, end_offset
+
+
 # — Indexing ———————————————————————————————————————————————————————————————
 
 def index_sessions(conn, force=False):
@@ -586,7 +681,7 @@ def index_sessions(conn, force=False):
         )
     }
 
-    # Collect files from both sources
+    # Collect files from every source
     sources = []
 
     # Claude Code: ~/.claude/projects/**/*.jsonl
@@ -603,6 +698,11 @@ def index_sessions(conn, force=False):
     pi_pattern = str(PI_SESSIONS_DIR / "**" / "*.jsonl")
     for fpath in glob(pi_pattern, recursive=True):
         sources.append((fpath, "pi"))
+
+    # Grok: ~/.grok/sessions/**/chat_history.jsonl
+    grok_pattern = str(GROK_SESSIONS_DIR / "**" / "chat_history.jsonl")
+    for fpath in glob(grok_pattern, recursive=True):
+        sources.append((fpath, "grok"))
 
     indexed = 0
     skipped = 0
@@ -633,8 +733,10 @@ def index_sessions(conn, force=False):
             result = parse_claude_session(fpath, start)
         elif source == "codex":
             result = parse_codex_session(fpath, start)
-        else:  # pi
+        elif source == "pi":
             result = parse_pi_session(fpath, start)
+        else:  # grok
+            result = parse_grok_session(fpath, start)
 
         # A file that could not be read keeps whatever is already indexed for
         # it, rather than being pruned on a transient error.
@@ -898,11 +1000,11 @@ def format_timestamp(ts_ms):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Search past Claude Code, Codex, and pi sessions")
+    parser = argparse.ArgumentParser(description="Search past Claude Code, Codex, pi and Grok sessions")
     parser.add_argument("query", nargs="?", help="Search query (FTS5 syntax: quotes for phrases, AND/OR/NOT). Omit to list all sessions in the time window without text matching.")
     parser.add_argument("--project", help="Filter to sessions from a specific project path (prefix match)")
     parser.add_argument("--days", type=int, help="Only sessions from last N days")
-    parser.add_argument("--source", choices=["claude", "codex", "pi"], help="Filter by source (claude, codex, or pi)")
+    parser.add_argument("--source", choices=["claude", "codex", "pi", "grok"], help="Filter by source (claude, codex, pi, or grok)")
     parser.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
     parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
 
