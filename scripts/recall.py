@@ -100,14 +100,14 @@ def create_schema(conn):
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
             session_id UNINDEXED,
-            role,
+            role UNINDEXED,
             text,
             tokenize='porter unicode61'
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk USING fts5(
             session_id UNINDEXED,
-            role,
+            role UNINDEXED,
             text,
             tokenize='trigram'
         );
@@ -127,6 +127,51 @@ def migrate_schema(conn):
         conn.execute("ALTER TABLE sessions ADD COLUMN file_path TEXT DEFAULT ''")
         conn.commit()
 
+
+
+# The two message tables, and the tokenizer each is built with.
+MESSAGE_TABLES = (("messages", "porter unicode61"), ("messages_cjk", "trigram"))
+
+
+def migrate_message_columns(conn):
+    """Rebuild any message table that still indexes the role column.
+
+    `role` holds the literal words "user" and "assistant", so indexing it made
+    both behave as wildcards: on a 197k-message index, `MATCH 'assistant'`
+    matched 172,597 rows, only 5,038 of which contain the word. FTS5 column
+    options cannot be altered, so the table is rebuilt from the rows already in
+    it — nothing is re-read from disk, which matters because sessions whose
+    files have since been deleted exist nowhere else.
+    """
+    for table, tokenize in MESSAGE_TABLES:
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()
+        if not schema or "role UNINDEXED" in schema[0]:
+            continue
+
+        print(f"Rebuilding {table} so roles are no longer searchable...",
+              file=sys.stderr)
+        # One explicit transaction. Left to itself sqlite3 commits each DDL
+        # statement as it runs, so a run killed part way through would leave a
+        # half-built table that every later run then died on.
+        conn.execute("BEGIN")
+        try:
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE {table}_rebuilt USING fts5(
+                    session_id UNINDEXED,
+                    role UNINDEXED,
+                    text,
+                    tokenize='{tokenize}'
+                )
+            """)
+            conn.execute(f"INSERT INTO {table}_rebuilt(session_id, role, text) "
+                         f"SELECT session_id, role, text FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {table}_rebuilt RENAME TO {table}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
 
 def migrate_db_location():
@@ -903,10 +948,14 @@ def main():
     create_schema(conn)
     migrate_schema(conn)
 
-    # Index — one run at a time, so concurrent runs queue instead of colliding
+    # Index — one run at a time, so concurrent runs queue instead of colliding.
+    # The role-column rebuild takes seconds on a large index, well past
+    # SQLite's busy timeout, so it must sit inside the lock too; a run that
+    # doesn't get the lock searches the old schema, which still works.
     t0 = time.time()
     with index_lock() as have_lock:
         if have_lock:
+            migrate_message_columns(conn)
             indexed, skipped, total_sessions, total_messages = index_sessions(conn, force=args.reindex)
         else:
             indexed = 0
